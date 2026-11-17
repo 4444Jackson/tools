@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -88,6 +89,121 @@ class PdhCpu:
         return min(v.doubleValue, 100.0)
 
 
+class _PdhFmtValueItem(ctypes.Structure):
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhValue)]
+
+
+class PdhGpu:
+    """GPU utilization matching Task Manager / TrafficMonitor: PDH
+    \\GPU Engine(*)\\Utilization Percentage, grouped by engine type (max).
+    Same algorithm as TrafficMonitor's CPdhGPUUsage::GetGpuUsage."""
+
+    PATH = u"\\GPU Engine(*)\\Utilization Percentage"
+    PDH_FMT_DOUBLE = 0x00000200
+    PDH_MORE_DATA = 0x800007D2
+
+    def __init__(self):
+        self._pdh = ctypes.WinDLL("pdh")
+        self.q = ctypes.c_void_p()
+        self.c = ctypes.c_void_p()
+        if self._pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.q)) != 0:
+            raise OSError("PdhOpenQueryW failed")
+        r = self._pdh.PdhAddEnglishCounterW(
+            self.q, self.PATH, 0, ctypes.byref(self.c))
+        if r != 0:
+            self._pdh.PdhCloseQuery(self.q)
+            raise OSError("PdhAddEnglishCounterW failed: %d" % r)
+        self._pdh.PdhCollectQueryData(self.q)  # prime instance list
+
+    def _formatted_array(self, buf, size, count):
+        return self._pdh.PdhGetFormattedCounterArrayW(
+            self.c, self.PDH_FMT_DOUBLE, ctypes.byref(size),
+            ctypes.byref(count), buf)
+
+    def get(self):
+        if self._pdh.PdhCollectQueryData(self.q) != 0:
+            raise OSError("PdhCollectQueryData failed")
+        size = ctypes.c_uint32(0)
+        count = ctypes.c_uint32(0)
+        r = self._formatted_array(None, size, count)
+        if (r & 0xFFFFFFFF) != self.PDH_MORE_DATA or size.value == 0:
+            return None
+        buf = (ctypes.c_byte * size.value)()
+        r = self._formatted_array(buf, size, count)
+        if r != 0 or count.value == 0:
+            return None
+        items = ctypes.cast(buf, ctypes.POINTER(_PdhFmtValueItem))
+        by_engine = {}
+        for i in range(count.value):
+            name = items[i].szName or ""
+            if items[i].FmtValue.CStatus != 0:
+                continue
+            key = name.rsplit("_", 1)[-1]  # engtype_3d/copy/video...
+            by_engine[key] = by_engine.get(key, 0.0) + items[i].FmtValue.doubleValue
+        return min(100.0, max(by_engine.values())) if by_engine else None
+
+
+class LenovoFanWmi:
+    """Fallback fan reader for Lenovo laptops whose EC fans LHM cannot enumerate.
+    Uses the same LENOVO_OTHER_METHOD.GetFeatureValue WMI path as Legion Toolkit.
+    Returns (cpu_rpm, gpu_rpm, cpu_max, gpu_max); zeros when unavailable. Read-only."""
+
+    SCOPE = "\\\\.\\root\\WMI"
+    QUERY = "SELECT * FROM LENOVO_OTHER_METHOD"
+    QUERY_MAX = "SELECT * FROM LENOVO_FAN_TABLE_DATA"
+    CPU_FAN_ID = 0x04030001
+    GPU_FAN_ID = 0x04030002
+
+    def __init__(self):
+        self._mo = None
+        self._max = {1: 0, 2: 0}
+        try:
+            clr.AddReference("System.Management")
+            import System
+            from System.Management import ManagementObjectSearcher, ObjectQuery
+
+            scope = System.Management.ManagementScope(self.SCOPE)
+            scope.Connect()
+            searcher = ManagementObjectSearcher(scope, ObjectQuery(self.QUERY))
+            for obj in searcher.Get():
+                self._mo = obj
+                break
+            # Max RPM per fan from the fan table (same source Legion Toolkit uses)
+            for obj in ManagementObjectSearcher(scope, ObjectQuery(self.QUERY_MAX)).Get():
+                try:
+                    fan_id = int(obj["Fan_Id"])
+                    val = obj["CurrentFanMaxSpeed"]
+                    if fan_id in self._max and val is not None:
+                        self._max[fan_id] = max(self._max[fan_id], int(val))
+                except Exception:
+                    pass
+        except Exception:
+            self._mo = None
+
+    @property
+    def available(self):
+        return self._mo is not None
+
+    def _get(self, cap_id):
+        if self._mo is None:
+            return 0
+        try:
+            import System
+            from System.Management import InvokeMethodOptions
+
+            inp = self._mo.GetMethodParameters("GetFeatureValue")
+            inp["IDs"] = System.UInt32(cap_id)
+            res = self._mo.InvokeMethod("GetFeatureValue", inp, InvokeMethodOptions())
+            val = res["Value"]
+            return int(val) if val is not None else 0
+        except Exception:
+            return 0
+
+    def read(self):
+        return (self._get(self.CPU_FAN_ID), self._get(self.GPU_FAN_ID),
+                self._max.get(1, 0), self._max.get(2, 0))
+
+
 HWND_TOPMOST = -1
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
@@ -163,6 +279,8 @@ class MonFloat:
         self.sensors = self._index_sensors()
         self.fans = self._index_fans()
         self._fan_shown = False
+        # LHM sees no fan sensors on some Lenovo ECs; fall back to WMI (Legion Toolkit path)
+        self.wmi_fan = LenovoFanWmi() if not self.fans else None
 
         self._net = psutil.net_io_counters()
         self._net_t = time.time()
@@ -172,6 +290,19 @@ class MonFloat:
             self._pdh_cpu = PdhCpu()
         except Exception:
             self._pdh_cpu = None  # fall back to psutil classic diff
+        try:
+            self._pdh_gpu = PdhGpu()
+        except Exception:
+            self._pdh_gpu = None  # fall back to LHM GPU load
+
+        # TrafficMonitor-style: collect sensors in a background thread so the
+        # UI thread stays free for smooth dragging. Cache holds render-ready text.
+        self._cache = {}
+        self._cache_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._fan_shown = False
+        self._collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
+        self._collect_thread.start()
 
         self._build_form()
 
@@ -443,73 +574,107 @@ class MonFloat:
 
     def _on_close(self, sender, e):
         self.timer.Stop()
+        self._stop_event.set()
+        try:
+            self._collect_thread.join(timeout=2.0)
+        except Exception:
+            pass
         try:
             self.comp.Close()
         finally:
             self._save()
 
-    # ---------- data loop ----------
+    # ---------- background collection (TrafficMonitor-style) ----------
+    def _collect_loop(self):
+        """Worker thread: sample sensors into a text cache. UI thread never
+        touches LHM/PDH/WMI here, so dragging stays smooth."""
+        while not self._stop_event.is_set():
+            try:
+                data = self._collect()
+                with self._cache_lock:
+                    self._cache = data
+            except Exception:
+                pass
+            self._stop_event.wait(max(0.2, self.cfg["interval_ms"] / 1000.0))
+
+    def _collect(self):
+        d = {}
+        for hw in self.comp.Hardware:
+            hw.Update()
+
+        cpu_t = self.sensors["cpu_temp"].Value if "cpu_temp" in self.sensors else None
+        cpu_l = None
+        if self._pdh_cpu is not None:
+            try:
+                cpu_l = self._pdh_cpu.get()
+            except Exception:
+                cpu_l = None
+        if cpu_l is None:
+            cpu_l = psutil.cpu_percent(interval=None)
+        d["cpu"] = ("CPU  %3.0f%%  %5.1f°C" % (cpu_l, cpu_t)
+                    if cpu_t is not None else "CPU  %3.0f%%   --" % cpu_l)
+
+        gpu_l = None
+        if self._pdh_gpu is not None:
+            try:
+                gpu_l = self._pdh_gpu.get()
+            except Exception:
+                gpu_l = None
+        if gpu_l is None:
+            loads = [s.Value for k, s in self.sensors.items()
+                     if k.startswith("gpu_load") and s.Value is not None]
+            gpu_l = max(loads) if loads else None
+        gpu_t = None
+        if "gpu_temp" in self.sensors:
+            v = self.sensors["gpu_temp"].Value
+            if v is not None and v > 1:
+                gpu_t = v
+        d["gpu"] = ("GPU  %3.0f%%  %s" % (gpu_l, ("%4.1f°C" % gpu_t) if gpu_t is not None else "--")
+                    if gpu_l is not None else "GPU   --   --")
+
+        mem = psutil.virtual_memory()
+        d["mem"] = "内存  %3.0f%%  %4.1fG" % (mem.percent, mem.used / (1024 ** 3))
+
+        rpm = 0
+        fan_pct = None
+        for s in self.fans:
+            v = s.Value
+            if v is not None and v > rpm:
+                rpm = v
+        if rpm <= 1 and self.wmi_fan is not None:
+            cpu_fan, gpu_fan, cpu_max, gpu_max = self.wmi_fan.read()
+            rpm, fan_max = (cpu_fan, cpu_max) if cpu_fan >= gpu_fan else (gpu_fan, gpu_max)
+            if fan_max > 0:
+                fan_pct = min(100.0, rpm * 100.0 / fan_max)
+        fan_text = "风扇  %4.0f RPM" % rpm
+        if fan_pct is not None:
+            fan_text += "  %2.0f%%" % fan_pct
+        d["fan_text"] = fan_text
+        d["fan_show"] = rpm > 1 or self._fan_shown
+
+        now = psutil.net_io_counters()
+        dt = time.time() - self._net_t
+        if dt > 0.2:
+            up = (now.bytes_sent - self._net.bytes_sent) / dt
+            down = (now.bytes_recv - self._net.bytes_recv) / dt
+            self._net, self._net_t = now, time.time()
+            d["net"] = "网络 ↑%s ↓%s" % (fmt_rate(up), fmt_rate(down))
+        return d
+
     def _tick(self, sender, e):
         try:
             self._tick_cnt += 1
             if self.cfg["topmost"]:
                 self._reassert_topmost()
-
-            for hw in self.comp.Hardware:
-                hw.Update()
-
-            cpu_t = self.sensors["cpu_temp"].Value if "cpu_temp" in self.sensors else None
-
-            cpu_l = None
-            if self._pdh_cpu is not None:
-                try:
-                    cpu_l = self._pdh_cpu.get()
-                except Exception:
-                    cpu_l = None
-            if cpu_l is None:
-                cpu_l = psutil.cpu_percent(interval=None)
-
-            gpu_loads = [s.Value for k, s in self.sensors.items()
-                         if k.startswith("gpu_load") and s.Value is not None]
-            gpu_t = None
-            if "gpu_temp" in self.sensors:
-                v = self.sensors["gpu_temp"].Value
-                if v is not None and v > 1:
-                    gpu_t = v
-
-            self.rows["cpu"].Text = ("CPU  %3.0f%%  %5.1f°C" % (cpu_l, cpu_t)
-                                     if cpu_t is not None else "CPU  %3.0f%%   --" % cpu_l)
-
-            if gpu_loads:
-                self.rows["gpu"].Text = "GPU  %3.0f%%  %s" % (
-                    max(gpu_loads), ("%4.1f°C" % gpu_t) if gpu_t is not None else "--")
-            else:
-                self.rows["gpu"].Text = "GPU   --   --"
-
-            mem = psutil.virtual_memory()
-            self.rows["mem"].Text = "内存  %3.0f%%  %4.1fG" % (mem.percent, mem.used / (1024 ** 3))
-
-            rpm = 0
-            for s in self.fans:
-                v = s.Value
-                if v is not None and v > rpm:
-                    rpm = v
-            if rpm > 1:
-                self._fan_shown = True
-                self.rows["fan"].Visible = True
-                self.rows["fan"].Text = "风扇  %4.0f RPM" % rpm
-            elif not self._fan_shown:
-                self.rows["fan"].Visible = False
-            else:  # was shown before: keep the row, 0 RPM is real (fan stopped)
-                self.rows["fan"].Text = "风扇  %4.0f RPM" % rpm
-
-            now = psutil.net_io_counters()
-            dt = time.time() - self._net_t
-            if dt > 0.2:
-                up = (now.bytes_sent - self._net.bytes_sent) / dt
-                down = (now.bytes_recv - self._net.bytes_recv) / dt
-                self._net, self._net_t = now, time.time()
-                self.rows["net"].Text = "网络 ↑%s ↓%s" % (fmt_rate(up), fmt_rate(down))
+            with self._cache_lock:
+                data = dict(self._cache)
+            for key in ("cpu", "gpu", "mem", "net"):
+                if key in data:
+                    self.rows[key].Text = data[key]
+            if "fan_text" in data:
+                self._fan_shown = data.get("fan_show", False)
+                self.rows["fan"].Visible = self._fan_shown
+                self.rows["fan"].Text = data["fan_text"]
         except Exception:
             pass
 
