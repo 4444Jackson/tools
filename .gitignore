@@ -1,0 +1,5 @@
+# runtime config / user state
+monfloat.json
+fnlock.json
+*.log
+__pycache__/
