@@ -12,9 +12,12 @@
 
 ## 免责声明
 
-本仓库的工具直接与 EC/ACPI 固件接口通信，属非官方接口。请在了解风险后自行决定使用；作者不对固件异常、保修问题等负责。请遵守当地法律及设备厂商条款。
+本仓库的工具直接与 EC/ACPI 固件接口通信，属非官方接口。请在了解风险后自行决定使用；作者不对固件异常、保修问题等负责。请遵守当地法律及设备厂商条款。与 Lenovo 无隶属或背书关系。
 
-## 第三方组件
+## 许可
 
-- `monfloat/lib/` 内含 [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) 运行库（MPL-2.0）
-- `EnergyControl.exe` 来自开源项目 EnergyControl
+- 本仓库原创脚本（monfloat.py、FnLockEC.py、analyze.py、各 bat/ps1）：MIT，见 [LICENSE](LICENSE)
+- 借用的第三方二进制及各自许可证：见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+  - LibreHardwareMonitor 运行库（MPL-2.0）
+  - EnergyControl.exe（GPL-3.0-only，源码见上游仓库）
+- 联想专有驱动的反汇编产物不随仓库分发

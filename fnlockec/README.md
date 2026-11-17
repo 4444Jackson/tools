@@ -10,7 +10,7 @@
   - `0x02` → 驱动执行 ACPI `HALS`，返回 4 字节状态，**bit 10 = Fn Lock 开关**
   - `0x0E` → ACPI `SALS`，开 Fn Lock（F1-F12 为标准功能键）
   - `0x0F` → ACPI `SALS`，关 Fn Lock（多媒体键优先）
-- 接口语义源自 Linux `ideapad-laptop` 驱动逆向；IOCTL 分发逻辑经本目录 `analyze.py` + `disasm.txt`（capstone 反汇编 AcpiVpc.sys 的产物）实证
+- 接口语义源自 Linux `ideapad-laptop` 驱动逆向；IOCTL 分发逻辑经 capstone 反汇编 AcpiVpc.sys 实证（`analyze.py` 是通用反汇编分析脚本；其产物 `disasm.txt` 因属联想专有驱动之衍生文本，不随本仓库分发，需时本地运行 `python analyze.py` 重新生成）
 
 ## 运行要求
 
